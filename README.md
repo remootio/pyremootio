@@ -102,3 +102,7 @@ unsubscribe = client.listen(on_event)
 ```bash
 pytest
 ```
+
+## Acknowledgments
+
+Special thanks to [Gergő Gábor Ilyes-Veisz](https://github.com/ivgg-me) for [aioremootio](https://github.com/ivgg-me/aioremootio), for creating his python Remootio API client while no official package was available.
