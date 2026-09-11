@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
+from unittest.mock import patch
 
 import aiohttp
 import pytest
@@ -66,6 +67,17 @@ async def _serve(fake: FakeRemootioDevice) -> AsyncIterator[tuple[str, int]]:
 class _SilentAfterAuthDevice(FakeRemootioDevice):
     async def _handle_frame(self, ws: web.WebSocketResponse, frame: dict[str, Any]) -> None:
         if frame.get("type") == "ENCRYPTED" and self._authenticated:
+            return
+        await super()._handle_frame(ws, frame)
+
+
+class _SilentChallengeResponseDevice(FakeRemootioDevice):
+    """Sends the AUTH challenge, then ignores the QUERY that would finish AUTH."""
+
+    drop_encrypted = True
+
+    async def _handle_frame(self, ws: web.WebSocketResponse, frame: dict[str, Any]) -> None:
+        if self.drop_encrypted and frame.get("type") == "ENCRYPTED":
             return
         await super()._handle_frame(ws, frame)
 
@@ -414,4 +426,127 @@ async def test_rejects_non_positive_ping_interval() -> None:
                 SPEC_AUTH_KEY,
                 session,
                 ping_interval=0,
+            )
+
+
+async def test_reconnect_auth_failures_from_first_attempt_then_recovers() -> None:
+    fake = _SilentChallengeResponseDevice()
+    auth_failed = asyncio.Event()
+    authenticated = asyncio.Event()
+
+    def on_auth_failure() -> None:
+        auth_failed.set()
+
+    def on_connection(connected: bool) -> None:
+        if connected:
+            authenticated.set()
+
+    with (
+        patch("pyremootio.client.INITIAL_RECONNECT_DELAY", 0.05),
+        patch("pyremootio.client.MAX_RECONNECT_DELAY", 0.1),
+        patch("pyremootio.client.MAX_RECONNECT_DELAY_AUTH", 0.2),
+    ):
+        async with (
+            _serve(fake) as (host, port),
+            aiohttp.ClientSession() as session,
+        ):
+            client = RemootioClient(
+                host,
+                SPEC_SECRET_KEY,
+                SPEC_AUTH_KEY,
+                session,
+                port=port,
+                ping_interval=10,
+                auth_timeout=0.3,
+                auth_fail_threshold=2,
+            )
+            client.listen_auth_failure(on_auth_failure)
+            client.listen_connection(on_connection)
+            await client.connect(reconnect=True)
+            try:
+                await asyncio.wait_for(auth_failed.wait(), timeout=5)
+                assert client.authenticated is False
+                fake.drop_encrypted = False
+                await asyncio.wait_for(authenticated.wait(), timeout=5)
+                assert client.authenticated is True
+            finally:
+                await client.disconnect()
+
+
+async def test_reconnect_connect_failures_do_not_count_as_auth() -> None:
+    connect_failed = asyncio.Event()
+    auth_failed = asyncio.Event()
+
+    def on_connect_failure() -> None:
+        connect_failed.set()
+
+    def on_auth_failure() -> None:
+        auth_failed.set()
+
+    with (
+        patch("pyremootio.client.INITIAL_RECONNECT_DELAY", 0.05),
+        patch("pyremootio.client.MAX_RECONNECT_DELAY", 0.1),
+        patch("pyremootio.client.MAX_RECONNECT_DELAY_CONN", 0.15),
+    ):
+        async with aiohttp.ClientSession() as session:
+            client = RemootioClient(
+                "127.0.0.1",
+                SPEC_SECRET_KEY,
+                SPEC_AUTH_KEY,
+                session,
+                port=1,
+                ping_interval=10,
+            )
+            client._conn_fail_threshold = 2
+            client.listen_connect_failure(on_connect_failure)
+            client.listen_auth_failure(on_auth_failure)
+            await client.connect(reconnect=True)
+            try:
+                await asyncio.wait_for(connect_failed.wait(), timeout=5)
+                assert not auth_failed.is_set()
+                assert client.authenticated is False
+            finally:
+                await client.disconnect()
+
+
+async def test_reconnects_after_device_closes_does_not_fire_auth_failure(
+    running_device: tuple[FakeRemootioDevice, str, int],
+) -> None:
+    fake, host, port = running_device
+    auth_failed = asyncio.Event()
+
+    def on_auth_failure() -> None:
+        auth_failed.set()
+
+    async with aiohttp.ClientSession() as session:
+        client = RemootioClient(
+            host,
+            SPEC_SECRET_KEY,
+            SPEC_AUTH_KEY,
+            session,
+            port=port,
+            ping_interval=10,
+            auth_fail_threshold=2,
+        )
+        client.listen_auth_failure(on_auth_failure)
+        await client.connect(reconnect=True)
+        try:
+            assert fake._ws is not None
+            await fake._ws.close()
+            await asyncio.sleep(1.5)
+            assert client.authenticated is True
+            assert not auth_failed.is_set()
+        finally:
+            await client.disconnect()
+
+
+async def test_rejects_non_positive_auth_fail_threshold() -> None:
+    async with aiohttp.ClientSession() as session:
+        with pytest.raises(ValueError, match="auth_fail_threshold"):
+            RemootioClient(
+                "127.0.0.1",
+                SPEC_SECRET_KEY,
+                SPEC_AUTH_KEY,
+                session,
+                auth_fail_threshold=0,
             )

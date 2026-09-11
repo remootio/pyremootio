@@ -48,7 +48,19 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`connect()` runs HELLO, AUTH, and the first QUERY action to authenticate the client. After that, `listen()` receives device events.
+`connect()` is one-shot. If it cannot connect or complete AUTH, it raises immediately.
+
+`connect(reconnect=True)` is for a long-lived client. It does not raise on connect/AUTH failure; it keeps retrying until `disconnect()`. After consecutive AUTH failures hit `auth_fail_threshold`, `listen_auth_failure` subscribers are notified. Reconnect does not stop.
+
+Subscribe **before** `connect(reconnect=True)`:
+
+```python
+def on_auth_failure():
+    print("AUTH failed repeatedly; API keys may have changed")
+
+unsubscribe = client.listen_auth_failure(on_auth_failure)
+await client.connect(reconnect=True)
+```
 
 Logging uses the standard `pyremootio` logger:
 
@@ -57,7 +69,7 @@ Logging uses the standard `pyremootio` logger:
 | `DEBUG` | PING / PONG keepalive |
 | `INFO` | connect, authenticate, disconnect (with reason) |
 | `WARNING` | connection lost, reconnect failed |
-| `ERROR` | unexpected receive-loop or listener failures |
+| `ERROR` | AUTH or TCP connect hit the failure threshold; unexpected receive-loop or listener failures |
 
 ```python
 import logging
@@ -92,6 +104,7 @@ unsubscribe = client.listen(on_event)
 
 - [`examples/trigger.py`](examples/trigger.py) — connect, trigger, wait for `StateChange`
 - [`examples/log_events.py`](examples/log_events.py) — log device events to stdout
+- [`examples/listen_auth_failure.py`](examples/listen_auth_failure.py) — `connect(reconnect=True)` and print when AUTH failures hit the threshold
 
 ```bash
 .venv/bin/python examples/trigger.py --host <ip_address> --secret-key <secret_key> --auth-key <auth_key>
