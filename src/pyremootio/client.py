@@ -15,7 +15,9 @@ import aiohttp
 from pyremootio.const import (
     ACTION_ID_MASK,
     DEFAULT_ACTION_TIMEOUT,
+    DEFAULT_AUTH_FAIL_THRESHOLD,
     DEFAULT_AUTH_TIMEOUT,
+    DEFAULT_CONNECT_TIMEOUT,
     DEFAULT_FAIL_THRESHOLD,
     DEFAULT_HELLO_TIMEOUT,
     DEFAULT_PING_INTERVAL,
@@ -66,10 +68,13 @@ class RemootioClient:
         ping_interval: float = DEFAULT_PING_INTERVAL,
         action_timeout: float = DEFAULT_ACTION_TIMEOUT,
         auth_timeout: float = DEFAULT_AUTH_TIMEOUT,
-        auth_fail_threshold: int = DEFAULT_FAIL_THRESHOLD,
+        connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
+        auth_fail_threshold: int = DEFAULT_AUTH_FAIL_THRESHOLD,
     ) -> None:
         if ping_interval <= 0:
             raise ValueError("ping_interval must be positive")
+        if connect_timeout <= 0:
+            raise ValueError("connect_timeout must be positive")
         if auth_fail_threshold < 1:
             raise ValueError("auth_fail_threshold must be >= 1")
         self._host = host
@@ -80,6 +85,7 @@ class RemootioClient:
         self._ping_timeout = ping_interval / 2
         self._action_timeout = action_timeout
         self._auth_timeout = auth_timeout
+        self._connect_timeout = connect_timeout
         self._auth_fail_threshold = auth_fail_threshold
         self._conn_fail_threshold = DEFAULT_FAIL_THRESHOLD
         self._auth_fail = 0
@@ -126,7 +132,8 @@ class RemootioClient:
         ping_interval: float = DEFAULT_PING_INTERVAL,
         action_timeout: float = DEFAULT_ACTION_TIMEOUT,
         auth_timeout: float = DEFAULT_AUTH_TIMEOUT,
-        auth_fail_threshold: int = DEFAULT_FAIL_THRESHOLD,
+        connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
+        auth_fail_threshold: int = DEFAULT_AUTH_FAIL_THRESHOLD,
     ) -> RemootioClient:
         return cls(
             host,
@@ -137,6 +144,7 @@ class RemootioClient:
             ping_interval=ping_interval,
             action_timeout=action_timeout,
             auth_timeout=auth_timeout,
+            connect_timeout=connect_timeout,
             auth_fail_threshold=auth_fail_threshold,
         )
 
@@ -247,7 +255,26 @@ class RemootioClient:
             if not reconnect:
                 raise
             self._record_failure(err)
-        if reconnect and (self._reconnect_task is None or self._reconnect_task.done()):
+        except RemootioTimeoutError:
+            if not reconnect:
+                raise
+            _LOGGER.debug(
+                "Remootio did not reply to HELLO (%s:%s); retrying",
+                self._host,
+                self._port,
+            )
+            self._reconnect_delay = min(self._reconnect_delay * 2, MAX_RECONNECT_DELAY)
+        if reconnect:
+            self.enable_reconnect()
+
+    def enable_reconnect(self) -> None:
+        """Keep reconnecting after the current session drops.
+
+        Call after a successful ``connect()``. Does not open a new connection.
+        """
+        self._reconnect = True
+        self._closed_by_user = False
+        if self._reconnect_task is None or self._reconnect_task.done():
             self._reconnect_task = asyncio.create_task(
                 self._reconnect_loop(),
                 name="pyremootio-reconnect",
@@ -299,18 +326,21 @@ class RemootioClient:
         url = f"ws://{self._host}:{self._port}/"
         _LOGGER.debug("Connecting to %s", url)
         try:
-            self._ws = await self._session.ws_connect(
-                url,
-                heartbeat=None,
-                autoping=False,
-                compress=0,
-            )
+            async with asyncio.timeout(self._connect_timeout):
+                self._ws = await self._session.ws_connect(
+                    url,
+                    heartbeat=None,
+                    autoping=False,
+                    compress=0,
+                )
+        except TimeoutError as err:
+            raise RemootioConnectionError(f"Timed out connecting to {url}") from err
         except (aiohttp.ClientError, OSError) as err:
             raise RemootioConnectionError(f"Could not connect to {url}") from err
 
         self._conn_fail = 0
         self._conn_fail_notified = False
-        _LOGGER.info("Connected to Remootio websocket (%s:%s)", self._host, self._port)
+        _LOGGER.debug("Connected to Remootio websocket (%s:%s)", self._host, self._port)
 
         self._receive_task = asyncio.create_task(
             self._receive_loop(),
@@ -324,8 +354,12 @@ class RemootioClient:
         await self._send_basic({"type": "HELLO"})
         # The device parses only one websocket frame per recv(). Sending AUTH in
         # the same TCP packet as HELLO would drop AUTH and stall authentication.
-        with suppress(TimeoutError):
+        try:
             await asyncio.wait_for(self._hello_event.wait(), timeout=DEFAULT_HELLO_TIMEOUT)
+        except TimeoutError as err:
+            self._set_disconnect_reason("no SERVER_HELLO")
+            await self._shutdown(notify=False)
+            raise RemootioTimeoutError("No SERVER_HELLO") from err
         await self._send_basic({"type": "AUTH"})
 
         try:
@@ -368,7 +402,7 @@ class RemootioClient:
                     await self._receive_task
             if self._closed_by_user or not self._reconnect:
                 return
-            _LOGGER.warning(
+            _LOGGER.debug(
                 "Remootio connection lost (%s:%s): %s; reconnecting in %.1fs",
                 self._host,
                 self._port,
@@ -386,8 +420,16 @@ class RemootioClient:
                 RemootioCryptoError,
             ) as err:
                 self._record_failure(err)
+            except RemootioTimeoutError as err:
+                _LOGGER.debug(
+                    "Remootio did not reply to HELLO (%s:%s): %s",
+                    self._host,
+                    self._port,
+                    err,
+                )
+                self._reconnect_delay = min(self._reconnect_delay * 2, MAX_RECONNECT_DELAY)
             except RemootioError as err:
-                _LOGGER.warning("Reconnect failed (%s:%s): %s", self._host, self._port, err)
+                _LOGGER.debug("Reconnect failed (%s:%s): %s", self._host, self._port, err)
                 self._reconnect_delay = min(self._reconnect_delay * 2, MAX_RECONNECT_DELAY)
             except Exception:
                 _LOGGER.exception(
@@ -401,7 +443,7 @@ class RemootioClient:
         """Count a failed attempt and raise the backoff cap after the threshold."""
         if isinstance(err, RemootioConnectionError):
             self._conn_fail += 1
-            _LOGGER.warning(
+            _LOGGER.debug(
                 "Remootio connect failed (%s:%s): %s (%s/%s)",
                 self._host,
                 self._port,
@@ -425,7 +467,7 @@ class RemootioClient:
             )
         else:
             self._auth_fail += 1
-            _LOGGER.warning(
+            _LOGGER.debug(
                 "Remootio authentication did not complete (%s:%s): %s (%s/%s)",
                 self._host,
                 self._port,
@@ -492,7 +534,7 @@ class RemootioClient:
         self._ws = None
         reason = self._disconnect_reason or "unknown"
         if had_connection:
-            _LOGGER.info(
+            _LOGGER.debug(
                 "Disconnected from Remootio (%s:%s): %s",
                 self._host,
                 self._port,
@@ -553,6 +595,14 @@ class RemootioClient:
         if frame_type == "SERVER_HELLO":
             self._server_hello = ServerHello.from_frame(frame)
             self._hello_event.set()
+            _LOGGER.debug(
+                "Received SERVER_HELLO from Remootio (%s:%s serial=%s api=%s version=%s)",
+                self._host,
+                self._port,
+                self._server_hello.serial_number,
+                self._server_hello.api_version,
+                self._server_hello.remootio_version,
+            )
             return
         if frame_type == "PONG":
             _LOGGER.debug("Received PONG from Remootio (%s:%s)", self._host, self._port)
@@ -712,9 +762,9 @@ class RemootioClient:
             self._pending.pop(action_id, None)
             if not future.done():
                 future.cancel()
-            raise RemootioTimeoutError(
-                f"Timed out waiting for {action_type.value} response"
-            ) from err
+            reason = f"Timed out waiting for {action_type.value} response"
+            await self._close_socket(reason)
+            raise RemootioTimeoutError(reason) from err
 
     async def _send_encrypted(self, payload: dict[str, Any]) -> None:
         if self._session_key is None:
@@ -764,9 +814,12 @@ class RemootioClient:
             await asyncio.sleep(self._ping_timeout)
         except asyncio.CancelledError:
             return
-        self._set_disconnect_reason(
+        await self._close_socket(
             f"no response to PING within {int(self._ping_timeout * 1000)} ms"
         )
+
+    async def _close_socket(self, reason: str) -> None:
+        self._set_disconnect_reason(reason)
         if self._ws is not None and not self._ws.closed:
             await self._ws.close()
 

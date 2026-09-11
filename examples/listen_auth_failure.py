@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Stay connected with reconnect=True and print AUTH failure notifications.
 
-``listen_auth_failure`` fires once consecutive AUTH attempts (challenge then QUERY)
-hit ``auth_fail_threshold`` (default 10). Reconnect keeps running.
+``listen_auth_failure`` fires once consecutive AUTH failures hit
+``auth_fail_threshold``. AUTH is only attempted after ``SERVER_HELLO``.
+Reconnect keeps running.
 
 Example (from this folder, after installing into .venv):
 
@@ -18,6 +19,7 @@ import logging
 import aiohttp
 
 from pyremootio import RemootioClient
+from pyremootio.const import DEFAULT_AUTH_FAIL_THRESHOLD
 
 
 async def main() -> None:
@@ -29,8 +31,9 @@ async def main() -> None:
     parser.add_argument(
         "--auth-fail-threshold",
         type=int,
-        default=4,
-        help="consecutive AUTH failures before listen_auth_failure fires (default: 10)",
+        default=DEFAULT_AUTH_FAIL_THRESHOLD,
+        help="consecutive AUTH failures before listen_auth_failure fires "
+        f"(default: {DEFAULT_AUTH_FAIL_THRESHOLD})",
     )
     args = parser.parse_args()
 
@@ -38,7 +41,7 @@ async def main() -> None:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
-    logging.getLogger("pyremootio").setLevel(logging.INFO)
+    logging.getLogger("pyremootio").setLevel(logging.DEBUG)
 
     def on_auth_failure() -> None:
         logging.error(

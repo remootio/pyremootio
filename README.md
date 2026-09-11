@@ -48,7 +48,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`connect()` is one-shot. If it cannot connect or complete AUTH, it raises immediately.
+`connect()` is one-shot. If it cannot connect or complete AUTH, it raises immediately. After a successful `connect()`, call `enable_reconnect()` to keep the session alive without opening a second websocket.
 
 `connect(reconnect=True)` is for a long-lived client. It does not raise on connect/AUTH failure; it keeps retrying until `disconnect()`. After consecutive AUTH failures hit `auth_fail_threshold`, `listen_auth_failure` subscribers are notified. Reconnect does not stop.
 
@@ -66,9 +66,8 @@ Logging uses the standard `pyremootio` logger:
 
 | Level | What you see |
 | --- | --- |
-| `DEBUG` | PING / PONG keepalive |
-| `INFO` | connect, authenticate, disconnect (with reason) |
-| `WARNING` | connection lost, reconnect failed |
+| `DEBUG` | PING / PONG, connect/disconnect, reconnect retries, per-attempt AUTH / TCP failures |
+| `INFO` | authenticated session |
 | `ERROR` | AUTH or TCP connect hit the failure threshold; unexpected receive-loop or listener failures |
 
 ```python
@@ -98,7 +97,9 @@ unsubscribe = client.listen(on_event)
 | `trigger_secondary(duration_minutes=None)` | Pulse the free relay output |
 | `restart()` | Reboot the device (connection drops) |
 
-`duration_minutes` holds the output active. It is rejected unless `api_version` is 3 or later. Failed actions raise `RemootioActionError`.
+`duration_minutes` holds the output active. It is rejected unless `api_version` is 3 or later. 
+
+Failed actions raise `RemootioActionError`. A timed-out action closes the websocket so a client started with `connect(reconnect=True)` can AUTH again. AUTH is not sent until `SERVER_HELLO` arrives, so `listen_auth_failure` only counts failures after the device has already replied, so the api client does not assume credentials are wrong for device that is only  busy temporarily.
 
 ## Examples
 
