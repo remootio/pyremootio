@@ -21,7 +21,7 @@ import logging
 
 import aiohttp
 
-from pyremootio import RemootioClient, RemootioEvent
+from pyremootio import RemootioAuthenticationError, RemootioClient, RemootioEvent
 
 
 async def main() -> None:
@@ -47,6 +47,12 @@ async def main() -> None:
     async def on_event(event: RemootioEvent) -> None:
         logging.info("%s state=%s cnt=%s data=%s", event.type, event.state, event.cnt, event.data)
 
+    stopped = asyncio.Event()
+
+    def on_auth_failure() -> None:
+        logging.error("API keys are no longer valid; stopping")
+        stopped.set()
+
     async with aiohttp.ClientSession() as session:
         client = RemootioClient(
             args.host,
@@ -56,7 +62,12 @@ async def main() -> None:
             port=args.port,
         )
         client.listen(on_event)
-        await client.connect(reconnect=True)
+        client.listen_auth_failure(on_auth_failure)
+        try:
+            await client.connect(reconnect=True)
+        except RemootioAuthenticationError:
+            logging.error("Invalid API keys")
+            return
         logging.info(
             "Listening (serial=%s, api=%s, state=%s)",
             client.serial_number,
@@ -64,7 +75,7 @@ async def main() -> None:
             client.state,
         )
         try:
-            await asyncio.Event().wait()
+            await stopped.wait()
         finally:
             await client.disconnect()
 

@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """Stay connected with reconnect=True and print AUTH failure notifications.
 
-``listen_auth_failure`` fires once consecutive AUTH failures hit
-``auth_fail_threshold``. AUTH is only attempted after ``SERVER_HELLO``.
-Reconnect keeps running.
+Invalid keys on the first AUTH raise from ``connect()``. ``listen_auth_failure``
+fires if keys fail later; the client then stops.
 
 Example (from this folder, after installing into .venv):
 
-    .venv/bin/python examples/listen_auth_failure.py --host <ip_address> --secret-key <secret_key> --auth-key <auth_key> --auth-fail-threshold <threshold>
+    .venv/bin/python examples/listen_auth_failure.py --host <ip_address> --secret-key <secret_key> --auth-key <auth_key>
 """
 
 from __future__ import annotations
@@ -18,8 +17,7 @@ import logging
 
 import aiohttp
 
-from pyremootio import RemootioClient
-from pyremootio.const import DEFAULT_AUTH_FAIL_THRESHOLD
+from pyremootio import RemootioAuthenticationError, RemootioClient
 
 
 async def main() -> None:
@@ -28,13 +26,6 @@ async def main() -> None:
     parser.add_argument("--secret-key", required=True)
     parser.add_argument("--auth-key", required=True)
     parser.add_argument("--port", type=int, default=8080)
-    parser.add_argument(
-        "--auth-fail-threshold",
-        type=int,
-        default=DEFAULT_AUTH_FAIL_THRESHOLD,
-        help="consecutive AUTH failures before listen_auth_failure fires "
-        f"(default: {DEFAULT_AUTH_FAIL_THRESHOLD})",
-    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -44,11 +35,7 @@ async def main() -> None:
     logging.getLogger("pyremootio").setLevel(logging.DEBUG)
 
     def on_auth_failure() -> None:
-        logging.error(
-            "AUTH failed %s times in a row; API keys may have changed. "
-            "Reconnect is still running.",
-            args.auth_fail_threshold,
-        )
+        logging.error("AUTH failed after the session was up; client stopped")
 
     def on_connection(connected: bool) -> None:
         if connected:
@@ -63,15 +50,19 @@ async def main() -> None:
             args.auth_key,
             session,
             port=args.port,
-            auth_fail_threshold=args.auth_fail_threshold,
         )
         client.listen_auth_failure(on_auth_failure)
         client.listen_connection(on_connection)
-        await client.connect(reconnect=True)
+        try:
+            await client.connect(reconnect=True)
+        except RemootioAuthenticationError:
+            logging.error("Invalid API keys")
+            return
         logging.info(
-            "Running with reconnect (serial=%s, authenticated=%s)",
+            "Running with reconnect (serial=%s, authenticated=%s, is_running=%s)",
             client.serial_number,
             client.authenticated,
+            client.is_running,
         )
         try:
             await asyncio.Event().wait()

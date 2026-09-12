@@ -48,27 +48,42 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`connect()` is one-shot. If it cannot connect or complete AUTH, it raises immediately. After a successful `connect()`, call `enable_reconnect()` to keep the session alive without opening a second websocket.
+`connect()` opens the websocket and authenticates. Invalid API keys raise `RemootioAuthenticationError`. A missing `SERVER_HELLO` or a TCP failure raises as well. After a successful `connect()`, call `enable_reconnect()` to keep the session alive without opening a second websocket.
 
-`connect(reconnect=True)` is for a long-lived client. It does not raise on connect/AUTH failure; it keeps retrying until `disconnect()`. After consecutive AUTH failures hit `auth_fail_threshold`, `listen_auth_failure` subscribers are notified. Reconnect does not stop.
+`connect(reconnect=True)` retries TCP failures and handshake timeouts until `disconnect()`. Invalid keys raise `RemootioAuthenticationError` from the `connect()` call. If AUTH fails later — for example the keys were changed on the device — `listen_auth_failure` runs once, reconnect stops, and `is_running` becomes False. `is_running` is True while a session is up or TCP/timeout retries are in progress, and False after `disconnect()` or that AUTH stop. 
 
-Subscribe **before** `connect(reconnect=True)`:
+What happens in the background:
+
+1. Open the websocket. TCP / upgrade failure → `RemootioConnectionError`.
+2. Send `HELLO` and wait for `SERVER_HELLO`. No reply → `RemootioTimeoutError`.
+3. Send `AUTH`. The device replies with an encrypted challenge.
+4. Verify the challenge with the secret keys. Failure → `RemootioAuthenticationError("Invalid API keys")`.
+5. Send `QUERY` to finish AUTH. A device `authentication error` frame → `RemootioAuthenticationError`.
+6. If `HELLO` succeeded but AUTH never completes (no challenge, or no `QUERY` response) → `RemootioTimeoutError`.
+7. A `QUERY` response → the session is authenticated.
+
+Subscribe to `listen_auth_failure` before `connect()` if you need that later-AUTH callback:
 
 ```python
+from pyremootio import RemootioAuthenticationError
+
 def on_auth_failure():
-    print("AUTH failed repeatedly; API keys may have changed")
+    print("API keys are no longer valid; client stopped")
 
 unsubscribe = client.listen_auth_failure(on_auth_failure)
-await client.connect(reconnect=True)
+try:
+    await client.connect(reconnect=True)
+except RemootioAuthenticationError:
+    print("Invalid API keys")
 ```
 
 Logging uses the standard `pyremootio` logger:
 
 | Level | What you see |
 | --- | --- |
-| `DEBUG` | PING / PONG, connect/disconnect, reconnect retries, per-attempt AUTH / TCP failures |
+| `DEBUG` | PING / PONG, connect/disconnect, reconnect retries, per-attempt TCP failures |
 | `INFO` | authenticated session |
-| `ERROR` | AUTH or TCP connect hit the failure threshold; unexpected receive-loop or listener failures |
+| `ERROR` | AUTH failed (client stopped); TCP connect hit the failure threshold; unexpected receive-loop or listener failures |
 
 ```python
 import logging
@@ -99,13 +114,13 @@ unsubscribe = client.listen(on_event)
 
 `duration_minutes` holds the output active. It is rejected unless `api_version` is 3 or later. 
 
-Failed actions raise `RemootioActionError`. A timed-out action closes the websocket so a client started with `connect(reconnect=True)` can AUTH again. AUTH is not sent until `SERVER_HELLO` arrives, so `listen_auth_failure` only counts failures after the device has already replied, so the api client does not assume credentials are wrong for device that is only  busy temporarily.
+Failed actions raise `RemootioActionError`. A timed-out action closes the websocket so a client started with `connect(reconnect=True)` can AUTH again. AUTH is not sent until `SERVER_HELLO` arrives. A missing challenge or `QUERY` response is a timeout, not invalid keys.
 
 ## Examples
 
 - [`examples/trigger.py`](examples/trigger.py) — connect, trigger, wait for `StateChange`
 - [`examples/log_events.py`](examples/log_events.py) — log device events to stdout
-- [`examples/listen_auth_failure.py`](examples/listen_auth_failure.py) — `connect(reconnect=True)` and print when AUTH failures hit the threshold
+- [`examples/listen_auth_failure.py`](examples/listen_auth_failure.py) — `connect(reconnect=True)` and print when AUTH fails after the session was up
 
 ```bash
 .venv/bin/python examples/trigger.py --host <ip_address> --secret-key <secret_key> --auth-key <auth_key>
