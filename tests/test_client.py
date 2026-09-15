@@ -293,6 +293,59 @@ async def test_action_timeout() -> None:
         assert client.authenticated is False
 
 
+async def test_cancelled_action_cleans_up_pending_request() -> None:
+    async with (
+        _serve(_SilentAfterAuthDevice()) as (host, port),
+        aiohttp.ClientSession() as session,
+        RemootioClient(
+            host,
+            SPEC_SECRET_KEY,
+            SPEC_AUTH_KEY,
+            session,
+            port=port,
+            ping_interval=10,
+        ) as client,
+    ):
+        task = asyncio.create_task(client.trigger())
+        await asyncio.sleep(0.05)
+        assert client._pending
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert client._pending == {}
+
+
+async def test_send_failure_cleans_up_and_raises_connection_error(
+    running_device: tuple[FakeRemootioDevice, str, int],
+) -> None:
+    _fake, host, port = running_device
+    async with (
+        aiohttp.ClientSession() as session,
+        RemootioClient(
+            host,
+            SPEC_SECRET_KEY,
+            SPEC_AUTH_KEY,
+            session,
+            port=port,
+            ping_interval=10,
+        ) as client,
+    ):
+        assert client._ws is not None
+        with (
+            patch.object(
+                client._ws,
+                "send_str",
+                side_effect=ConnectionResetError("connection lost"),
+            ),
+            pytest.raises(RemootioConnectionError, match="Failed to send"),
+        ):
+            await client.trigger()
+
+        assert client._pending == {}
+
+
 async def test_action_timeout_reconnects_and_auths() -> None:
     lost = asyncio.Event()
     restored = asyncio.Event()
@@ -552,6 +605,60 @@ async def test_ping_without_pong_disconnects() -> None:
             await client.disconnect()
 
 
+async def test_events_do_not_mask_missing_pong() -> None:
+    class NoPongDevice(FakeRemootioDevice):
+        async def _handle_frame(self, ws: web.WebSocketResponse, frame: dict[str, Any]) -> None:
+            if frame.get("type") == "PING":
+                return
+            await super()._handle_frame(ws, frame)
+
+    fake = NoPongDevice()
+    lost = asyncio.Event()
+
+    def on_connection(connected: bool) -> None:
+        if not connected:
+            lost.set()
+
+    async def push_events() -> None:
+        count = 0
+        while not lost.is_set():
+            try:
+                await fake.push_event(
+                    {
+                        "cnt": count,
+                        "type": "StateChange",
+                        "state": "open",
+                        "t100ms": count,
+                    }
+                )
+            except RuntimeError:
+                return
+            count += 1
+            await asyncio.sleep(0.02)
+
+    async with (
+        _serve(fake) as (host, port),
+        aiohttp.ClientSession() as session,
+    ):
+        client = RemootioClient(
+            host,
+            SPEC_SECRET_KEY,
+            SPEC_AUTH_KEY,
+            session,
+            port=port,
+            ping_interval=0.2,
+        )
+        client.listen_connection(on_connection)
+        await client.connect()
+        event_task = asyncio.create_task(push_events())
+        try:
+            await asyncio.wait_for(lost.wait(), timeout=2)
+            assert client.authenticated is False
+        finally:
+            await client.disconnect()
+            await event_task
+
+
 async def test_rejects_non_positive_ping_interval() -> None:
     async with aiohttp.ClientSession() as session:
         with pytest.raises(ValueError, match="positive"):
@@ -798,4 +905,35 @@ async def test_reconnect_stops_when_keys_change_later(
                 assert client.is_running is False
             finally:
                 await client.disconnect()
+
+
+async def test_async_listener_can_disconnect(
+    running_device: tuple[FakeRemootioDevice, str, int],
+) -> None:
+    fake, host, port = running_device
+    listener_completed = asyncio.Event()
+
+    async with aiohttp.ClientSession() as session:
+        client = RemootioClient(
+            host,
+            SPEC_SECRET_KEY,
+            SPEC_AUTH_KEY,
+            session,
+            port=port,
+            ping_interval=10,
+        )
+
+        async def on_event(_event: RemootioEvent) -> None:
+            await client.disconnect()
+            listener_completed.set()
+
+        client.listen(on_event)
+        await client.connect(reconnect=True)
+        await fake.push_event(
+            {"cnt": 72, "type": "StateChange", "state": "open", "t100ms": 18342}
+        )
+
+        await asyncio.wait_for(listener_completed.wait(), timeout=2)
+        assert client.connected is False
+        assert client.is_running is False
 

@@ -106,6 +106,7 @@ class FakeRemootioDevice:
                 return
             challenge = encrypt_payload(
                 {
+                    "type": "CHALLENGE",
                     "challenge": {
                         "sessionKey": self.session_key,
                         "initialActionId": self.initial_action_id,

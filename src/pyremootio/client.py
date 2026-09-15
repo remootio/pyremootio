@@ -298,12 +298,12 @@ class RemootioClient:
         self._reconnect = False
         self._running = False
         self._set_disconnect_reason("client requested disconnect")
+        await self._shutdown()
         if self._reconnect_task is not None:
             self._reconnect_task.cancel()
             with suppress(asyncio.CancelledError):
                 await self._reconnect_task
             self._reconnect_task = None
-        await self._shutdown()
 
     async def __aenter__(self) -> Self:
         await self.connect()
@@ -505,7 +505,12 @@ class RemootioClient:
         self._session_key = None
         self._fail_pending(RemootioConnectionError("Disconnected from Remootio"))
 
-        tasks = [self._ping_watchdog, self._ping_task, *self._callback_tasks]
+        current_task = asyncio.current_task()
+        tasks = [
+            task
+            for task in (self._ping_watchdog, self._ping_task, *self._callback_tasks)
+            if task is not current_task
+        ]
         if not from_receive:
             tasks.append(self._receive_task)
         for task in tasks:
@@ -546,7 +551,6 @@ class RemootioClient:
             return
         try:
             async for message in ws:
-                self._clear_ping_watchdog()
                 if message.type in {aiohttp.WSMsgType.TEXT, aiohttp.WSMsgType.BINARY}:
                     raw = message.data
                     if isinstance(raw, bytes):
@@ -600,6 +604,7 @@ class RemootioClient:
             )
             return
         if frame_type == "PONG":
+            self._clear_ping_watchdog()
             _LOGGER.debug("Received PONG from Remootio (%s:%s)", self._host, self._port)
             return
         if frame_type == "ERROR":
@@ -649,7 +654,7 @@ class RemootioClient:
         self._session_key = challenge.session_key
         self._last_action_id = challenge.initial_action_id
         try:
-            await self._send_action(ActionType.QUERY, wait=False)
+            await self._send_action_no_wait(ActionType.QUERY)
         except RemootioError as err:
             self._fail_authentication(err)
 
@@ -701,6 +706,17 @@ class RemootioClient:
         self._last_action_id = (self._last_action_id + 1) % ACTION_ID_MASK
         return self._last_action_id
 
+    def _build_action(
+        self,
+        action_type: ActionType,
+        duration_minutes: int | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        action_id = self._allocate_action_id()
+        action: dict[str, Any] = {"type": action_type.value, "id": action_id}
+        if duration_minutes is not None:
+            action["duration"] = duration_minutes
+        return action_id, {"action": action}
+
     async def _request_action(
         self,
         action_type: ActionType,
@@ -726,39 +742,47 @@ class RemootioClient:
         self,
         action_type: ActionType,
         duration_minutes: int | None = None,
-        *,
-        wait: bool = True,
     ) -> ActionResponse:
         async with self._action_lock:
-            action_id = self._allocate_action_id()
-            action: dict[str, Any] = {"type": action_type.value, "id": action_id}
-            if duration_minutes is not None:
-                action["duration"] = duration_minutes
+            action_id, payload = self._build_action(action_type, duration_minutes)
             loop = asyncio.get_running_loop()
             future: asyncio.Future[ActionResponse] = loop.create_future()
             self._pending[action_id] = future
-            await self._send_encrypted({"action": action})
-
-        if not wait:
-            return ActionResponse(
-                type=action_type,
-                id=action_id,
-                success=True,
-                state=self._state,
-                t100ms=0,
-                relay_triggered=False,
-                error_code="",
-            )
+            try:
+                await self._send_encrypted(payload)
+            except RemootioConnectionError as err:
+                self._pending.pop(action_id, None)
+                future.cancel()
+                await self._close_socket(str(err))
+                raise
+            except BaseException:
+                self._pending.pop(action_id, None)
+                future.cancel()
+                raise
 
         try:
             return await asyncio.wait_for(future, timeout=self._action_timeout)
         except TimeoutError as err:
-            self._pending.pop(action_id, None)
             if not future.done():
                 future.cancel()
             reason = f"Timed out waiting for {action_type.value} response"
             await self._close_socket(reason)
             raise RemootioTimeoutError(reason) from err
+        finally:
+            self._pending.pop(action_id, None)
+
+    async def _send_action_no_wait(
+        self,
+        action_type: ActionType,
+        duration_minutes: int | None = None,
+    ) -> None:
+        async with self._action_lock:
+            _, payload = self._build_action(action_type, duration_minutes)
+            try:
+                await self._send_encrypted(payload)
+            except RemootioConnectionError as err:
+                await self._close_socket(str(err))
+                raise
 
     async def _send_encrypted(self, payload: dict[str, Any]) -> None:
         if self._session_key is None:
@@ -771,12 +795,20 @@ class RemootioClient:
         await self._send_raw(frame)
 
     async def _send_basic(self, frame: dict[str, Any]) -> None:
-        await self._send_raw(frame)
+        try:
+            await self._send_raw(frame)
+        except RemootioConnectionError as err:
+            await self._close_socket(str(err))
+            raise
 
     async def _send_raw(self, frame: dict[str, Any]) -> None:
         if self._ws is None or self._ws.closed:
             raise RemootioConnectionError("Not connected to Remootio")
-        await self._ws.send_str(compact_json(frame))
+        try:
+            await self._ws.send_str(compact_json(frame))
+        except (aiohttp.ClientError, OSError, RuntimeError) as err:
+            reason = "Failed to send frame to Remootio"
+            raise RemootioConnectionError(reason) from err
 
     async def _ping_loop(self) -> None:
         try:
